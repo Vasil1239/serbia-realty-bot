@@ -15,6 +15,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: group-bot
@@ -37,6 +38,14 @@ jobs:
           GROUP_CHAT_ID: ${{ vars.GROUP_CHAT_ID }}
           FORCE_RUN: ${{ github.event.inputs.force || '0' }}
         run: python group_bot.py
+
+      - name: Контроль бесплатных минут GitHub Actions
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GROUP_CHAT_ID: ${{ vars.GROUP_CHAT_ID }}
+        run: python quota_check.py
 
       - name: Сохранить память публикаций
         run: |
