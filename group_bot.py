@@ -5,15 +5,15 @@
 
 Источники (см. sources.py):
   сайты      — 4zida.rs, KupujemProdajem, oglasi.rs, CityExpert, nadjidom.com,
-               imovina.net, realitica.com, nekretnine365.com
+               imovina.net, nekretnine365.com (realitica.com блокирует GitHub — отключён)
   Telegram   — публичные каналы-агрегаторы (в т.ч. перепосты halooglasi.com и
                nekretnine.rs, которые напрямую закрыты защитой от ботов)
 
 Категории: продажа квартир, продажа домов, аренда квартир, аренда домов.
 Каждый пост содержит ссылку на первоисточник.
 
-Расписание: 10:00, 13:00, 16:00, 19:00 по Белграду (RUN_HOURS_LOCAL);
-с 22:00 до 10:00 публикаций нет.
+Расписание: 10:00, 13:00, 16:00, 19:00, 22:00 по Белграду (RUN_HOURS_LOCAL);
+последний выпуск в 22:00, ночью до 10:00 публикаций нет.
 
 Переменные окружения:
   BOT_TOKEN      — токен бота (@BotFather)
@@ -39,7 +39,7 @@ GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
 FORCE_RUN = os.environ.get("FORCE_RUN", "") == "1"
 
 LOCAL_TZ = ZoneInfo("Europe/Belgrade")
-RUN_HOURS_LOCAL = {10, 13, 16, 19}
+RUN_HOURS_LOCAL = {10, 13, 16, 19, 22}
 LOOKBACK_HOURS = 16                  # утренний запуск покрывает вечер и ночь
 MAX_POSTS_PER_KIND = 6               # постов на категорию за запуск
 MAX_POSTS_MORNING = 12               # утром (10:00) публикуем всё найденное за вечер и ночь
@@ -66,7 +66,6 @@ DATED_SITES = {
 # сайты без даты в выдаче — берём только id новее уже виденного (водяной знак)
 WATERMARK_SITES = {
     "imovina":       lambda k, d: S.fetch_imovina(k, d),
-    "realitica":     lambda k, d: S.fetch_realitica(k, d),
     "nekretnine365": lambda k, d: S.fetch_nekretnine365(k, d),
 }
 # Telegram-каналы: (канал, kind, deal или "both")
@@ -87,7 +86,7 @@ TG_CHANNELS = [
 SOURCE_NAMES = {
     "4zida": "4zida.rs", "kupujemprodajem": "KupujemProdajem", "oglasi_rs": "oglasi.rs",
     "cityexpert": "CityExpert", "nadjidom": "nadjidom.com", "imovina": "imovina.net",
-    "realitica": "realitica.com", "nekretnine365": "nekretnine365.com",
+    "nekretnine365": "nekretnine365.com",
 }
 # ===============================================
 
@@ -208,6 +207,14 @@ def is_fresh(r, since):
     return dt >= since
 
 
+def kind_matches(r, kind):
+    """nadjidom подмешивает квартиры в раздел домов и наоборот — отсекаем по URL."""
+    u = (r.get("url") or "").lower()
+    if r["source"] != "nadjidom":
+        return True
+    return not (("-stan." in u and kind == "houses") or ("-kuca." in u and kind == "apartments"))
+
+
 def fingerprint(r):
     place = (r.get("place") or r.get("address") or "").lower().split(",")[0].strip()
     m2 = r.get("m2")
@@ -320,7 +327,8 @@ def collect(since, state):
     for kind, deal, _, _ in CATEGORIES:
         for name, fn in DATED_SITES.items():
             try:
-                items = [r for r in fn(kind, deal) if r.get("price") and is_fresh(r, since)]
+                items = [r for r in fn(kind, deal) if r.get("price") and is_fresh(r, since)
+                         and kind_matches(r, kind)]
             except Exception as e:
                 log(f"  ! {name} {kind}/{deal}: {type(e).__name__}: {e}")
                 items = []
