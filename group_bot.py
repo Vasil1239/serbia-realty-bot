@@ -3,20 +3,21 @@
 """
 Бот «Новые объявления недвижимости Сербии» для Telegram-ГРУППЫ.
 
-Что делает:
-  1. Забирает самые свежие объявления с портала 4zida.rs (открытый API,
-     сортировка по дате публикации) по четырём категориям:
-     продажа квартир, продажа домов, аренда квартир, аренда домов.
-  2. Берёт только объявления не старше LOOKBACK_HOURS часов и с ценой.
-  3. Отсекает дубли (файл состояния group_posted.json).
-  4. Публикует до MAX_POSTS_PER_KIND объявлений на категорию в группу
-     со ссылкой на первоисточник.
-  5. Работает только в «дневные» часы по Белграду (RUN_HOURS_LOCAL);
-     ночью (22:00–10:00) ничего не публикует.
+Источники (см. sources.py):
+  сайты      — 4zida.rs, KupujemProdajem, oglasi.rs, CityExpert, nadjidom.com,
+               imovina.net, realitica.com, nekretnine365.com
+  Telegram   — публичные каналы-агрегаторы (в т.ч. перепосты halooglasi.com и
+               nekretnine.rs, которые напрямую закрыты защитой от ботов)
+
+Категории: продажа квартир, продажа домов, аренда квартир, аренда домов.
+Каждый пост содержит ссылку на первоисточник.
+
+Расписание: 10:00, 13:00, 16:00, 19:00 по Белграду (RUN_HOURS_LOCAL);
+с 22:00 до 10:00 публикаций нет.
 
 Переменные окружения:
   BOT_TOKEN      — токен бота (@BotFather)
-  GROUP_CHAT_ID  — числовой id группы (например -1001234567890)
+  GROUP_CHAT_ID  — числовой id группы
   FORCE_RUN=1    — запустить вне расписания (для теста)
 """
 
@@ -24,10 +25,13 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+import sources as S
 
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -35,53 +39,113 @@ GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
 FORCE_RUN = os.environ.get("FORCE_RUN", "") == "1"
 
 LOCAL_TZ = ZoneInfo("Europe/Belgrade")
-RUN_HOURS_LOCAL = {10, 13, 16, 19, 22}   # раз в 3 часа, ночью тишина
-LOOKBACK_HOURS = 13                      # утренний запуск покрывает ночь
-MAX_POSTS_PER_KIND = 5                   # постов на категорию за запуск (4 категории)
-PAGES_TO_SCAN = 3                        # страниц по 20 объявлений (сортировка по новизне)
-PAUSE_BETWEEN_POSTS = 4                  # секунд между постами (лимит групп ~20/мин)
-PRIORITY_KEYWORDS = ("beograd",)         # эти локации публикуются первыми
+RUN_HOURS_LOCAL = {10, 13, 16, 19}
+LOOKBACK_HOURS = 16                  # утренний запуск покрывает вечер и ночь
+MAX_POSTS_PER_KIND = 6               # постов на категорию за запуск
+MAX_POSTS_MORNING = 12               # утром (10:00) публикуем всё найденное за вечер и ночь
+MORNING_HOUR = 10
+PAUSE_BETWEEN_POSTS = 4
+PRIORITY_KEYWORDS = ("beograd", "belgrade", "белград", "novi beograd")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "group_posted.json")
 
-# (тип, сделка, заголовок, хэштеги)
 CATEGORIES = [
     ("apartments", "sale", "Продажа квартиры", "#продажа #квартира"),
     ("houses",     "sale", "Продажа дома",     "#продажа #дом"),
     ("apartments", "rent", "Аренда квартиры",  "#аренда #квартира"),
     ("houses",     "rent", "Аренда дома",      "#аренда #дом"),
 ]
+
+# сайты с точной датой публикации
+DATED_SITES = {
+    "4zida":           lambda k, d: fetch_4zida(k, d),
+    "kupujemprodajem": lambda k, d: S.fetch_kupujemprodajem(k, d, page=2),
+    "oglasi_rs":       lambda k, d: S.fetch_oglasi_rs(k, d),
+    "cityexpert":      lambda k, d: S.fetch_cityexpert(k, d),
+    "nadjidom":        lambda k, d: S.fetch_nadjidom(k, d),
+}
+# сайты без даты в выдаче — берём только id новее уже виденного (водяной знак)
+WATERMARK_SITES = {
+    "imovina":       lambda k, d: S.fetch_imovina(k, d),
+    "realitica":     lambda k, d: S.fetch_realitica(k, d),
+    "nekretnine365": lambda k, d: S.fetch_nekretnine365(k, d),
+}
+# Telegram-каналы: (канал, kind, deal или "both")
+TG_CHANNELS = [
+    ("belgrade_apartmens", "apartments", "rent"),
+    ("novisad_apartmens",  "apartments", "rent"),
+    ("BelgradeRental",     "apartments", "rent"),
+    ("rent_bg",            "apartments", "rent"),
+    ("rent_ns",            "apartments", "rent"),
+    ("flattorentbelgrade", "apartments", "rent"),
+    ("FlatsInBelgrade",    "apartments", "rent"),
+    ("beograd_stan",       "apartments", "rent"),
+    ("novisad_stan",       "apartments", "rent"),
+    ("kvartiraSerbia",     "apartments", "both"),
+    ("flattobuybelgrade",  "apartments", "sale"),
+]
+
+SOURCE_NAMES = {
+    "4zida": "4zida.rs", "kupujemprodajem": "KupujemProdajem", "oglasi_rs": "oglasi.rs",
+    "cityexpert": "CityExpert", "nadjidom": "nadjidom.com", "imovina": "imovina.net",
+    "realitica": "realitica.com", "nekretnine365": "nekretnine365.com",
+}
 # ===============================================
 
-API = "https://api.4zida.rs/v6/search/{kind}?for={deal}&page={page}&sort=createdAtDesc"
-SITE = "https://www.4zida.rs"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+ROOMS_RU = {"0.5": "студия", "1": "1-комн.", "1.0": "1-комн.", "1.5": "1.5-комн.",
+            "2": "2-комн.", "2.0": "2-комн.", "2.5": "2.5-комн.", "3": "3-комн.",
+            "3.0": "3-комн.", "3.5": "3.5-комн.", "4": "4-комн.", "4.0": "4-комн.",
+            "4.5": "4.5-комн.", "5": "5+ комн.", "5.0": "5+ комн.",
+            "garsonjera": "студия", "jednosoban": "1-комн.", "jednoiposoban": "1.5-комн.",
+            "dvosoban": "2-комн.", "dvoiposoban": "2.5-комн.", "trosoban": "3-комн.",
+            "troiposoban": "3.5-комн.", "cetvorosoban": "4-комн.", "četvorosoban": "4-комн.",
+            "petosoban": "5-комн.", "višesoban": "5+ комн."}
 
-ROOMS_RU = {"0.5": "студия", "1": "1-комн.", "1.5": "1.5-комн.", "2": "2-комн.",
-            "2.5": "2.5-комн.", "3": "3-комн.", "3.5": "3.5-комн.", "4": "4-комн.",
-            "4.5": "4.5-комн.", "5": "5+ комн."}
-
-CITY_TAGS = {"beograd": "#белград", "novi-sad": "#новисад", "nis": "#ниш",
-             "subotica": "#суботица", "kragujevac": "#крагуевац", "zlatibor": "#златибор",
-             "pancevo": "#панчево", "zemun": "#земун", "sabac": "#шабац",
-             "sombor": "#сомбор", "cacak": "#чачак", "kraljevo": "#кралево",
-             "vrnjacka-banja": "#врнячкабаня", "smederevo": "#смедерево",
-             "zrenjanin": "#зренянин", "valjevo": "#валево", "loznica": "#лозница"}
+CITY_TAGS = [("novi beograd", "#белград"), ("beograd", "#белград"), ("belgrade", "#белград"),
+             ("белград", "#белград"), ("novi sad", "#новисад"), ("нови сад", "#новисад"),
+             ("niš", "#ниш"), ("nis", "#ниш"), ("subotica", "#суботица"),
+             ("kragujevac", "#крагуевац"), ("zlatibor", "#златибор"), ("pančevo", "#панчево"),
+             ("pancevo", "#панчево"), ("zemun", "#земун"), ("šabac", "#шабац"),
+             ("sombor", "#сомбор"), ("čačak", "#чачак"), ("kraljevo", "#кралево"),
+             ("vrnjačka", "#врнячкабаня"), ("smederevo", "#смедерево"), ("zrenjanin", "#зренянин")]
 
 
 def log(msg):
     print(msg, flush=True)
 
 
-def http_json(url):
-    req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
+# ---------- 4zida (адаптер к общему формату) ----------
+def fetch_4zida(kind, deal, pages=2):
+    out = []
+    for page in range(1, pages + 1):
+        url = f"https://api.4zida.rs/v6/search/{kind}?for={deal}&page={page}&sort=createdAtDesc"
+        d = json.loads(S.http_get(url))
+        ads = d.get("ads", []) if isinstance(d, dict) else []
+        for ad in ads:
+            img = (ad.get("image") or {}).get("search") or {}
+            photo = img.get("380x0_fill_0_jpeg") or img.get("380x0_fill_0_webp")
+            names = [n for n in (ad.get("placeNames") or [])
+                     if n.lower() not in ("gradske lokacije", "okolne lokacije")]
+            floor = ad.get("redactedFloor")
+            total = ad.get("redactedTotalFloors")
+            r = S.row("4zida", ad.get("id"), "https://www.4zida.rs" + (ad.get("urlPath") or ""),
+                      ad.get("title"), S.to_int(ad.get("price")), S.to_float(ad.get("m2")),
+                      ad.get("roomCount"), ", ".join(names[:3]), ad.get("createdAt"), photo)
+            r["address"] = ad.get("address")
+            r["desc"] = ad.get("description100")
+            r["extra"] = (f"этаж {floor}/{total}" if floor is not None and total else None)
+            if kind == "houses" and (ad.get("lotSize") or ad.get("lotArea")):
+                r["extra"] = f"участок {ad.get('lotSize') or ad.get('lotArea')} ар"
+            out.append(r)
+        if not ads:
+            break
+    return out
 
 
+# ---------- Telegram ----------
 def tg_call(method, payload):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(payload).encode()
-    req = urllib.request.Request(url, data=data, headers=UA)
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": S.UA})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read().decode("utf-8"))
@@ -92,11 +156,27 @@ def tg_call(method, payload):
             return {"ok": False, "description": str(e)}
 
 
+def send_post(text, photo):
+    if photo:
+        resp = tg_call("sendPhoto", {"chat_id": GROUP_CHAT_ID, "photo": photo,
+                                     "caption": text[:1000], "parse_mode": "HTML"})
+        if resp.get("ok"):
+            return resp
+        log(f"  ! фото не принято ({resp.get('description')}), шлю текстом")
+    return tg_call("sendMessage", {"chat_id": GROUP_CHAT_ID, "text": text[:4000],
+                                   "parse_mode": "HTML"})
+
+
+# ---------- состояние ----------
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {"posted": {}}
+            st = json.load(f)
+    else:
+        st = {}
+    st.setdefault("posted", {})
+    st.setdefault("watermark", {})
+    return st
 
 
 def save_state(state):
@@ -106,54 +186,36 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-def fetch_fresh_ads(kind, deal, since):
-    """Собирает свежие объявления одной категории (выдача отсортирована по новизне)."""
-    fresh = {}
-    for page in range(1, PAGES_TO_SCAN + 1):
-        try:
-            data = http_json(API.format(kind=kind, deal=deal, page=page))
-        except Exception as e:
-            log(f"  ! страница {page} ({kind}/{deal}): {e}")
-            continue
-        ads = data.get("ads", []) if isinstance(data, dict) else []
-        older_seen = 0
-        for ad in ads:
-            created = ad.get("createdAt", "")
-            if not created or not ad.get("price"):
-                continue
-            try:
-                dt = datetime.fromisoformat(created)
-            except ValueError:
-                continue
-            if dt < since:
-                older_seen += 1
-                continue
-            fresh[ad["id"]] = ad
-        # выдача по новизне: если почти вся страница старая — дальше смысла нет
-        if not ads or older_seen >= len(ads) - 2:
-            break
-        time.sleep(1)
-    return list(fresh.values())
+# ---------- утилиты ----------
+def parse_dt(s):
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt
 
 
-def fingerprint(ad):
-    return f"{ad.get('price')}|{ad.get('m2')}|{(ad.get('address') or '').lower()}"
+def is_fresh(r, since):
+    dt = parse_dt(r.get("created"))
+    if dt is None:
+        return False
+    if len(r.get("created") or "") <= 10:          # только дата (nadjidom) — берём сегодня/вчера
+        return dt.date() >= (since.astimezone(LOCAL_TZ).date())
+    return dt >= since
 
 
-def place_str(ad):
-    names = ad.get("placeNames") or []
-    if isinstance(names, str):
-        names = [names]
-    names = [n for n in names if n and n.lower() not in ("gradske lokacije", "okolne lokacije")]
-    return ", ".join(names[:3])
+def fingerprint(r):
+    place = (r.get("place") or r.get("address") or "").lower().split(",")[0].strip()
+    m2 = r.get("m2")
+    return f"{r.get('price')}|{int(m2) if m2 else '?'}|{place[:20]}"
 
 
-def city_tag(ad):
-    path = (ad.get("urlPath") or "").lower()
-    for key, tag in CITY_TAGS.items():
-        if key in path:
-            return tag
-    return "#сербия"
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")) if s else ""
 
 
 def fmt_money(v):
@@ -163,57 +225,181 @@ def fmt_money(v):
         return str(v)
 
 
-def format_post(ad, kind, deal, title, hashtags):
-    m2 = ad.get("m2", "?")
-    price = ad.get("price", 0)
-    url = SITE + (ad.get("urlPath") or "")
-    place = place_str(ad)
-    address = (ad.get("address") or ad.get("title") or "").strip()
-    desc = re.sub(r"\s+", " ", ad.get("description100") or "").strip()
-
-    head = f"<b>{title}</b> — {place or 'Сербия'}"
-    lines = [head]
-
-    details = [f"📐 {m2} м²"]
-    rooms = ad.get("roomCount")
-    if rooms is not None:
-        details.append(ROOMS_RU.get(str(rooms), f"{rooms}-комн."))
-    if kind == "houses":
-        lot = ad.get("lotSize") or ad.get("lotArea")
-        if lot:
-            details.append(f"участок {lot} ар")
-    else:
-        floor, total = ad.get("redactedFloor"), ad.get("redactedTotalFloors")
-        if floor is not None and total:
-            details.append(f"этаж {floor}/{total}")
-    lines.append(" · ".join(details))
-
-    ppm2 = ad.get("pricePerM2")
-    ppm2_txt = f" ({fmt_money(ppm2)} €/м²)" if ppm2 and deal == "sale" else ""
-    unit = "€" if deal == "sale" else "€/мес"
-    lines.append(f"💶 <b>{fmt_money(price)} {unit}</b>{ppm2_txt}")
-
-    if address:
-        names = [n.lower() for n in (ad.get("placeNames") or [])]
-        if address.lower() in names:
-            lines.append(f"📍 {place}")
-        else:
-            lines.append(f"📍 {address}" + (f", {place}" if place else ""))
-    if desc:
-        lines.append(desc[:150])
-    lines.append(f'🔗 <a href="{url}">Источник: 4zida.rs</a>')
-    tag = city_tag(ad)
-    lines.append(f"{hashtags} {tag}" + (" #сербия" if tag != "#сербия" else ""))
-    return "\n".join(lines), url
-
-
-def ad_photo(ad):
-    img = ad.get("image") or {}
-    search = img.get("search") or {}
-    for key in ("380x0_fill_0_jpeg", "380x0_fill_0_webp"):
-        if search.get(key):
-            return search[key]
+def rooms_ru(v):
+    if v is None:
+        return None
+    key = str(v).strip().lower().replace(",", ".")
+    if key in ROOMS_RU:
+        return ROOMS_RU[key]
+    for k, ru in ROOMS_RU.items():
+        if k in key:
+            return ru
+    if re.fullmatch(r"\d+(\.\d+)?", key):
+        return f"{key}-комн."
     return None
+
+
+def city_tag(r):
+    hay = " ".join(str(r.get(k) or "") for k in ("place", "address", "title", "url", "text")).lower()
+    for key, tag in CITY_TAGS:
+        if key in hay:
+            return tag
+    return "#сербия"
+
+
+def is_priority(r):
+    hay = " ".join(str(r.get(k) or "") for k in ("place", "address", "url", "title")).lower()
+    return any(k in hay for k in PRIORITY_KEYWORDS)
+
+
+def source_label(r):
+    src = r["source"]
+    if src.startswith("tg_"):
+        return f"Telegram @{src[3:]}"
+    return SOURCE_NAMES.get(src, src)
+
+
+def format_post(r, kind, deal, title, hashtags):
+    lines = [f"<b>{title}</b> — {esc(r.get('place') or 'Сербия')}"]
+    details = []
+    if r.get("m2"):
+        details.append(f"📐 {fmt_money(r['m2'])} м²")
+    rr = rooms_ru(r.get("rooms"))
+    if rr:
+        details.append(rr)
+    if r.get("extra"):
+        details.append(r["extra"])
+    if details:
+        lines.append(" · ".join(details))
+    unit = "€" if deal == "sale" else "€/мес"
+    if r.get("price"):
+        ppm2 = ""
+        if deal == "sale" and r.get("m2"):
+            ppm2 = f" ({fmt_money(r['price'] / r['m2'])} €/м²)"
+        lines.append(f"💶 <b>{fmt_money(r['price'])} {unit}</b>{ppm2}")
+    addr = r.get("address")
+    if addr and addr.lower() not in (r.get("place") or "").lower():
+        lines.append(f"📍 {esc(addr)}, {esc(r.get('place') or '')}".rstrip(", "))
+    desc = r.get("desc") or (r.get("title") if r["source"] != "4zida" else None)
+    if desc:
+        lines.append(esc(re.sub(r"\s+", " ", desc).strip()[:160]))
+    # ссылки на первоисточник
+    if r["source"].startswith("tg_"):
+        ext = [S.htmllib.unescape(l) for l in r.get("ext_links", []) if "maps" not in l and "google" not in l]
+        if ext:
+            host = urllib.parse.urlparse(ext[0]).netloc.replace("www.", "")
+            lines.append(f'🔗 <a href="{esc(ext[0])}">Источник: {esc(host)}</a> · '
+                         f'<a href="{esc(r["url"])}">пост в {esc(source_label(r))}</a>')
+        else:
+            lines.append(f'🔗 <a href="{esc(r["url"])}">Источник: {esc(source_label(r))}</a>')
+    else:
+        lines.append(f'🔗 <a href="{esc(r["url"])}">Источник: {esc(source_label(r))}</a>')
+    tag = city_tag(r)
+    lines.append(f"{hashtags} {tag}" + (" #сербия" if tag != "#сербия" else ""))
+    return "\n".join(lines)
+
+
+# ---------- сбор ----------
+def tg_category(ch_kind, ch_deal, r):
+    """Определяет категорию поста из Telegram-канала."""
+    txt = (r.get("text") or "").lower()
+    if ch_deal == "both":
+        deal = "sale" if re.search(r"прода|prodaj|sale|купить", txt) else "rent"
+    else:
+        deal = ch_deal
+    head = txt.split("\n")[0][:80]
+    kind = "houses" if re.search(r"\bдом\b|kuć|kuca|\bhouse\b|вилл", head) else ch_kind
+    return kind, deal
+
+
+def collect(since, state):
+    """Возвращает {(kind, deal): [записи]} со всех источников."""
+    bucket = {(k, d): [] for k, d, _, _ in CATEGORIES}
+    stats = {}
+
+    for kind, deal, _, _ in CATEGORIES:
+        for name, fn in DATED_SITES.items():
+            try:
+                items = [r for r in fn(kind, deal) if r.get("price") and is_fresh(r, since)]
+            except Exception as e:
+                log(f"  ! {name} {kind}/{deal}: {type(e).__name__}: {e}")
+                items = []
+            stats[name] = stats.get(name, 0) + len(items)
+            bucket[(kind, deal)] += items
+
+        for name, fn in WATERMARK_SITES.items():
+            wm_key = f"{name}:{kind}:{deal}"
+            try:
+                items = [r for r in fn(kind, deal) if r.get("price") and not r.get("promoted")]
+            except Exception as e:
+                log(f"  ! {name} {kind}/{deal}: {type(e).__name__}: {e}")
+                continue
+            ids = [int(re.sub(r"\D", "", r["id"].split(":", 1)[1]) or 0) for r in items]
+            if not ids:
+                continue
+            wm = state["watermark"].get(wm_key)
+            new_items = []
+            if wm is not None:
+                new_items = [r for r, i in zip(items, ids) if i > wm]
+            state["watermark"][wm_key] = max(ids + [wm or 0])
+            stats[name] = stats.get(name, 0) + len(new_items)
+            bucket[(kind, deal)] += new_items
+
+    for ch, ch_kind, ch_deal in TG_CHANNELS:
+        try:
+            posts = S.fetch_telegram(ch)
+        except Exception as e:
+            log(f"  ! @{ch}: {type(e).__name__}: {e}")
+            continue
+        n = 0
+        for r in posts:
+            txt = r.get("text") or ""
+            if not r.get("price") or not is_fresh(r, since) or len(txt) < 30:
+                continue
+            if txt.startswith("📊") or "owner listings today" in txt:   # сводки, не объявления
+                continue
+            kind, deal = tg_category(ch_kind, ch_deal, r)
+            r["place"] = r.get("place") or ch_place(ch)
+            r["desc"] = re.sub(r"https?://\S+", "", txt)
+            bucket[(kind, deal)].append(r)
+            n += 1
+        stats[f"@{ch}"] = n
+
+    log("  свежих по источникам: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    return bucket
+
+
+def ch_place(ch):
+    c = ch.lower()
+    if "novisad" in c or c == "rent_ns":
+        return "Novi Sad"
+    if "belgrade" in c or "beograd" in c or c == "rent_bg":
+        return "Beograd"
+    return "Сербия"
+
+
+def pick(items, state, limit):
+    """Отбор с чередованием источников; Белград и фото — в приоритете."""
+    seen_fp = set()
+    fresh = []
+    for r in items:
+        fp = fingerprint(r)
+        if r["id"] in state["posted"] or fp in state["posted"] or fp in seen_fp:
+            continue
+        seen_fp.add(fp)
+        fresh.append(r)
+    fresh.sort(key=lambda r: (not is_priority(r), r.get("photo") is None,
+                              -(parse_dt(r.get("created")) or datetime.min.replace(tzinfo=timezone.utc)).timestamp()))
+    by_src = {}
+    for r in fresh:
+        by_src.setdefault(r["source"], []).append(r)
+    order = sorted(by_src, key=lambda s: (s.startswith("tg_"), s != "4zida"))
+    chosen = []
+    while len(chosen) < limit and any(by_src.values()):
+        for s in order:
+            if by_src[s] and len(chosen) < limit:
+                chosen.append(by_src[s].pop(0))
+    return chosen
 
 
 def within_schedule():
@@ -232,50 +418,31 @@ def main():
 
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     state = load_state()
+    log("Сбор объявлений...")
+    bucket = collect(since, state)
+    save_state(state)
     posted_now = 0
 
+    limit = MAX_POSTS_MORNING if datetime.now(LOCAL_TZ).hour <= MORNING_HOUR else MAX_POSTS_PER_KIND
     for kind, deal, title, hashtags in CATEGORIES:
-        posted_in_kind = 0
-        log(f"Категория: {title}")
-        ads = fetch_fresh_ads(kind, deal, since)
-        ads.sort(key=lambda a: (
-            not any(k in (a.get("urlPath") or "") for k in PRIORITY_KEYWORDS),
-            ad_photo(a) is None,
-        ))
-        # среди равных — самые новые первыми
-        log(f"  найдено свежих: {len(ads)}")
-
-        for ad in ads:
-            if posted_in_kind >= MAX_POSTS_PER_KIND:
-                break
-            key, fp = ad["id"], fingerprint(ad)
-            if key in state["posted"] or fp in state["posted"]:
-                continue
-            text, url = format_post(ad, kind, deal, title, hashtags)
-            photo = ad_photo(ad)
-            if photo:
-                resp = tg_call("sendPhoto", {"chat_id": GROUP_CHAT_ID, "photo": photo,
-                                             "caption": text, "parse_mode": "HTML"})
-                if not resp.get("ok"):
-                    log(f"  ! фото не отправилось ({resp.get('description')}), шлю текстом")
-                    resp = tg_call("sendMessage", {"chat_id": GROUP_CHAT_ID, "text": text,
-                                                   "parse_mode": "HTML"})
-            else:
-                resp = tg_call("sendMessage", {"chat_id": GROUP_CHAT_ID, "text": text,
-                                               "parse_mode": "HTML"})
+        items = bucket[(kind, deal)]
+        chosen = pick(items, state, limit)
+        log(f"Категория: {title} — свежих {len(items)}, к публикации {len(chosen)}")
+        for r in chosen:
+            text = format_post(r, kind, deal, title, hashtags)
+            resp = send_post(text, r.get("photo"))
             if resp.get("ok"):
                 now = datetime.now(timezone.utc).isoformat()
-                state["posted"][key] = now
-                state["posted"][fp] = now
+                state["posted"][r["id"]] = now
+                state["posted"][fingerprint(r)] = now
                 posted_now += 1
-                posted_in_kind += 1
-                log(f"  ✓ опубликовано: {url}")
+                log(f"  ✓ {source_label(r)}: {r['url']}")
                 save_state(state)
                 time.sleep(PAUSE_BETWEEN_POSTS)
             else:
                 log(f"  ! Telegram отказал: {resp}")
                 if resp.get("error_code") == 429:
-                    time.sleep(int(resp.get("parameters", {}).get("retry_after", 30)) + 1)
+                    time.sleep(int((resp.get("parameters") or {}).get("retry_after", 30)) + 1)
 
     log(f"Готово. Опубликовано за запуск: {posted_now}")
 
