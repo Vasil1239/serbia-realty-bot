@@ -40,11 +40,11 @@ FORCE_RUN = os.environ.get("FORCE_RUN", "") == "1"
 
 LOCAL_TZ = ZoneInfo("Europe/Belgrade")
 RUN_HOURS_LOCAL = {10, 13, 16, 19, 22}
+POST_WINDOW_LOCAL = (10, 23)         # публикуем только с 10:00 до 23:00 (выпуск 22:00 успевает выйти);
+                                     # что не успели — уйдёт в 10:00 утра
 LOOKBACK_HOURS = 16                  # утренний запуск покрывает вечер и ночь
-MAX_POSTS_PER_KIND = 6               # постов на категорию за запуск
-MAX_POSTS_MORNING = 12               # утром (10:00) публикуем всё найденное за вечер и ночь
-MORNING_HOUR = 10
-PAUSE_BETWEEN_POSTS = 4
+MAX_POSTS_PER_KIND = None            # None = без лимита, публикуем всё найденное
+PAUSE_BETWEEN_POSTS = 3.2            # лимит Telegram ~20 сообщений/мин в группу
 PRIORITY_KEYWORDS = ("beograd", "belgrade", "белград", "novi beograd")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "group_posted.json")
 
@@ -403,11 +403,16 @@ def pick(items, state, limit):
         by_src.setdefault(r["source"], []).append(r)
     order = sorted(by_src, key=lambda s: (s.startswith("tg_"), s != "4zida"))
     chosen = []
-    while len(chosen) < limit and any(by_src.values()):
+    while (limit is None or len(chosen) < limit) and any(by_src.values()):
         for s in order:
-            if by_src[s] and len(chosen) < limit:
+            if by_src[s] and (limit is None or len(chosen) < limit):
                 chosen.append(by_src[s].pop(0))
     return chosen
+
+
+def posting_allowed():
+    h = datetime.now(LOCAL_TZ).hour
+    return POST_WINDOW_LOCAL[0] <= h < POST_WINDOW_LOCAL[1]
 
 
 def within_schedule():
@@ -431,12 +436,17 @@ def main():
     save_state(state)
     posted_now = 0
 
-    limit = MAX_POSTS_MORNING if datetime.now(LOCAL_TZ).hour <= MORNING_HOUR else MAX_POSTS_PER_KIND
+    limit = MAX_POSTS_PER_KIND
     for kind, deal, title, hashtags in CATEGORIES:
         items = bucket[(kind, deal)]
         chosen = pick(items, state, limit)
         log(f"Категория: {title} — свежих {len(items)}, к публикации {len(chosen)}")
         for r in chosen:
+            if not FORCE_RUN and not posting_allowed():
+                log("Вышли за разрешённое время публикаций — остаток выйдет утром в 10:00.")
+                save_state(state)
+                log(f"Опубликовано за запуск: {posted_now}")
+                return
             text = format_post(r, kind, deal, title, hashtags)
             resp = send_post(text, r.get("photo"))
             if resp.get("ok"):
