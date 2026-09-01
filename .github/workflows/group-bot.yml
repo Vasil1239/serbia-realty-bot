@@ -1,0 +1,48 @@
+name: group-bot
+
+on:
+  schedule:
+    # Цель: 10:00, 13:00, 16:00, 19:00, 22:00 по Белграду, ночью тишина.
+    # Запускаем в оба варианта UTC (летнее UTC+2 и зимнее UTC+1);
+    # скрипт сам проверяет местный час и пропускает лишний запуск.
+    - cron: '0 8,9,11,12,14,15,17,18,20,21 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Запустить вне расписания (1 = да)'
+        required: false
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: group-bot
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Публикация объявлений в группу
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          GROUP_CHAT_ID: ${{ vars.GROUP_CHAT_ID }}
+          FORCE_RUN: ${{ github.event.inputs.force || '0' }}
+        run: python group_bot.py
+
+      - name: Сохранить память публикаций
+        run: |
+          git config user.name "group-bot"
+          git config user.email "group-bot@users.noreply.github.com"
+          git add group_posted.json
+          git diff --cached --quiet || git commit -m "группа: обновление памяти публикаций"
+          git pull --rebase origin main || true
+          git push
