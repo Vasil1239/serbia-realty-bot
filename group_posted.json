@@ -137,5 +137,8 @@
   "nekretnine365:apartments:rent": 898912,
   "imovina:houses:rent": 1385905,
   "nekretnine365:houses:rent": 898775
+ },
+ "quota_warned": {
+  "2026-09": []
  }
 }
