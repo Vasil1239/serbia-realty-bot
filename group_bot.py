@@ -12,8 +12,9 @@
 Категории: продажа квартир, продажа домов, аренда квартир, аренда домов.
 Каждый пост содержит ссылку на первоисточник.
 
-Расписание: 10:00, 13:00, 16:00, 19:00, 21:00 по Белграду (RUN_HOURS_LOCAL);
-после 22:00 и до 10:00 публикаций нет.
+Расписание задаёт cron в .github/workflows/group-bot.yml (5 запусков в день);
+скрипт лишь следит за окном публикаций: после 22:00 и до 09:00 постов нет.
+Сбор идёт параллельно по источникам, посты — с шагом ~3 с (лимит Telegram 20/мин).
 
 Переменные окружения:
   BOT_TOKEN      — токен бота (@BotFather)
@@ -25,6 +26,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,12 +41,13 @@ GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
 FORCE_RUN = os.environ.get("FORCE_RUN", "") == "1"
 
 LOCAL_TZ = ZoneInfo("Europe/Belgrade")
-RUN_HOURS_LOCAL = {10, 13, 16, 19, 21}
-POST_WINDOW_LOCAL = (10, 22)         # публикуем строго с 10:00 до 22:00; после 22:00 — ни одного поста,
-                                     # что не успели — уйдёт в 10:00 утра
+POST_WINDOW_LOCAL = (9, 22)          # публикуем строго с 09:00 до 22:00; после 22:00 — ни одного поста,
+                                     # что не успели — уйдёт с утренним запуском
 LOOKBACK_HOURS = 16                  # утренний запуск покрывает вечер и ночь
 MAX_POSTS_PER_KIND = None            # None = без лимита, публикуем всё найденное
-PAUSE_BETWEEN_POSTS = 3.2            # лимит Telegram ~20 сообщений/мин в группу
+MIN_POST_INTERVAL = 3.05             # лимит Telegram 20 сообщений/мин в группу = 1 пост в 3 с
+                                     # (считается от начала предыдущей отправки, а не после неё)
+COLLECT_WORKERS = 8                  # параллельный сбор: по потоку на источник
 PRIORITY_KEYWORDS = ("beograd", "belgrade", "белград", "novi beograd")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "group_posted.json")
 
@@ -159,11 +162,32 @@ def send_post(text, photo):
     if photo:
         resp = tg_call("sendPhoto", {"chat_id": GROUP_CHAT_ID, "photo": photo,
                                      "caption": text[:1000], "parse_mode": "HTML"})
-        if resp.get("ok"):
+        if resp.get("ok") or resp.get("error_code") == 429:
             return resp
         log(f"  ! фото не принято ({resp.get('description')}), шлю текстом")
     return tg_call("sendMessage", {"chat_id": GROUP_CHAT_ID, "text": text[:4000],
                                    "parse_mode": "HTML"})
+
+
+_last_send = 0.0
+
+
+def send_paced(text, photo):
+    """Отправка с выдержкой MIN_POST_INTERVAL между началами отправок и одним повтором при 429."""
+    global _last_send
+    for attempt in range(2):
+        wait = MIN_POST_INTERVAL - (time.time() - _last_send)
+        if wait > 0:
+            time.sleep(wait)
+        _last_send = time.time()
+        resp = send_post(text, photo)
+        if resp.get("error_code") == 429 and attempt == 0:
+            retry = int((resp.get("parameters") or {}).get("retry_after", 30)) + 1
+            log(f"  ! Telegram просит подождать {retry} с")
+            time.sleep(retry)
+            continue
+        return resp
+    return resp
 
 
 # ---------- состояние ----------
@@ -319,29 +343,53 @@ def tg_category(ch_kind, ch_deal, r):
     return kind, deal
 
 
+def _fetch_site(name, fn):
+    """Один сайт по всем категориям (выполняется в своём потоке; запросы к сайту — последовательно)."""
+    out = []
+    for kind, deal, _, _ in CATEGORIES:
+        try:
+            out.append((kind, deal, fn(kind, deal), None))
+        except Exception as e:
+            out.append((kind, deal, [], f"{type(e).__name__}: {e}"))
+    return name, out
+
+
+def _fetch_channel(ch):
+    try:
+        return ch, S.fetch_telegram(ch), None
+    except Exception as e:
+        return ch, [], f"{type(e).__name__}: {e}"
+
+
 def collect(since, state):
-    """Возвращает {(kind, deal): [записи]} со всех источников."""
+    """Возвращает {(kind, deal): [записи]} со всех источников.
+    Сетевая часть идёт параллельно (поток на источник), фильтрация и состояние — в основном потоке."""
     bucket = {(k, d): [] for k, d, _, _ in CATEGORIES}
     stats = {}
 
-    for kind, deal, _, _ in CATEGORIES:
-        for name, fn in DATED_SITES.items():
-            try:
-                items = [r for r in fn(kind, deal) if r.get("price") and is_fresh(r, since)
-                         and kind_matches(r, kind)]
-            except Exception as e:
-                log(f"  ! {name} {kind}/{deal}: {type(e).__name__}: {e}")
-                items = []
+    with ThreadPoolExecutor(max_workers=COLLECT_WORKERS) as ex:
+        dated_f = [ex.submit(_fetch_site, n, fn) for n, fn in DATED_SITES.items()]
+        wm_f = [ex.submit(_fetch_site, n, fn) for n, fn in WATERMARK_SITES.items()]
+        tg_f = [ex.submit(_fetch_channel, ch) for ch, _, _ in TG_CHANNELS]
+        dated = [f.result() for f in dated_f]
+        wms = [f.result() for f in wm_f]
+        tgs = [f.result() for f in tg_f]
+
+    for name, per_cat in dated:
+        for kind, deal, rows, err in per_cat:
+            if err:
+                log(f"  ! {name} {kind}/{deal}: {err}")
+            items = [r for r in rows if r.get("price") and is_fresh(r, since) and kind_matches(r, kind)]
             stats[name] = stats.get(name, 0) + len(items)
             bucket[(kind, deal)] += items
 
-        for name, fn in WATERMARK_SITES.items():
-            wm_key = f"{name}:{kind}:{deal}"
-            try:
-                items = [r for r in fn(kind, deal) if r.get("price") and not r.get("promoted")]
-            except Exception as e:
-                log(f"  ! {name} {kind}/{deal}: {type(e).__name__}: {e}")
+    for name, per_cat in wms:
+        for kind, deal, rows, err in per_cat:
+            if err:
+                log(f"  ! {name} {kind}/{deal}: {err}")
                 continue
+            wm_key = f"{name}:{kind}:{deal}"
+            items = [r for r in rows if r.get("price") and not r.get("promoted")]
             ids = [int(re.sub(r"\D", "", r["id"].split(":", 1)[1]) or 0) for r in items]
             if not ids:
                 continue
@@ -353,12 +401,12 @@ def collect(since, state):
             stats[name] = stats.get(name, 0) + len(new_items)
             bucket[(kind, deal)] += new_items
 
-    for ch, ch_kind, ch_deal in TG_CHANNELS:
-        try:
-            posts = S.fetch_telegram(ch)
-        except Exception as e:
-            log(f"  ! @{ch}: {type(e).__name__}: {e}")
+    ch_meta = {ch: (k, d) for ch, k, d in TG_CHANNELS}
+    for ch, posts, err in tgs:
+        if err:
+            log(f"  ! @{ch}: {err}")
             continue
+        ch_kind, ch_deal = ch_meta[ch]
         n = 0
         for r in posts:
             txt = r.get("text") or ""
@@ -415,24 +463,21 @@ def posting_allowed():
     return POST_WINDOW_LOCAL[0] <= h < POST_WINDOW_LOCAL[1]
 
 
-def within_schedule():
-    now_local = datetime.now(LOCAL_TZ)
-    log(f"Местное время (Белград): {now_local:%Y-%m-%d %H:%M}")
-    return now_local.hour in RUN_HOURS_LOCAL
-
-
 def main():
     if not BOT_TOKEN or not GROUP_CHAT_ID:
         log("Не заданы BOT_TOKEN / GROUP_CHAT_ID — публикация пропущена.")
         return
-    if not FORCE_RUN and not within_schedule():
-        log("Вне расписания публикаций — пропуск запуска.")
+    log(f"Местное время (Белград): {datetime.now(LOCAL_TZ):%Y-%m-%d %H:%M}")
+    if not FORCE_RUN and not posting_allowed():
+        log("Вне окна публикаций (09:00–22:00) — пропуск запуска.")
         return
 
     since = datetime.now(timezone.utc) - timedelta(hours=LOOKBACK_HOURS)
     state = load_state()
-    log("Сбор объявлений...")
+    t0 = time.time()
+    log("Сбор объявлений (параллельно)...")
     bucket = collect(since, state)
+    log(f"  сбор занял {time.time() - t0:.0f} с")
     save_state(state)
     posted_now = 0
 
@@ -448,21 +493,20 @@ def main():
                 log(f"Опубликовано за запуск: {posted_now}")
                 return
             text = format_post(r, kind, deal, title, hashtags)
-            resp = send_post(text, r.get("photo"))
+            resp = send_paced(text, r.get("photo"))
             if resp.get("ok"):
                 now = datetime.now(timezone.utc).isoformat()
                 state["posted"][r["id"]] = now
                 state["posted"][fingerprint(r)] = now
                 posted_now += 1
                 log(f"  ✓ {source_label(r)}: {r['url']}")
-                save_state(state)
-                time.sleep(PAUSE_BETWEEN_POSTS)
+                if posted_now % 20 == 0:
+                    save_state(state)          # промежуточное сохранение на случай обрыва
             else:
                 log(f"  ! Telegram отказал: {resp}")
-                if resp.get("error_code") == 429:
-                    time.sleep(int((resp.get("parameters") or {}).get("retry_after", 30)) + 1)
 
-    log(f"Готово. Опубликовано за запуск: {posted_now}")
+    save_state(state)
+    log(f"Готово. Опубликовано за запуск: {posted_now}, всего {time.time() - t0:.0f} с")
 
 
 if __name__ == "__main__":

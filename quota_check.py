@@ -69,6 +69,12 @@ def main():
     if not (TOKEN and REPO and BOT_TOKEN and GROUP_CHAT_ID):
         print("quota_check: нет переменных окружения, пропуск")
         return
+    try:
+        if not gh(f"https://api.github.com/repos/{REPO}").get("private", True):
+            print("quota_check: репозиторий публичный — минуты Actions не ограничены, проверка не нужна")
+            return
+    except Exception as e:
+        print(f"quota_check: не удалось узнать видимость репозитория ({e}), считаем как приватный")
     used = used_minutes_this_month()
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     print(f"quota_check: за {month} использовано ~{used} мин из {FREE_MINUTES}")

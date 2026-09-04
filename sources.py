@@ -17,6 +17,7 @@ Run:  python3 sources_snippets.py         -> prints counts per source
 import json
 import re
 import sys
+import threading
 import time
 import html as htmllib
 import urllib.request
@@ -26,20 +27,26 @@ from html.parser import HTMLParser
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 PAUSE = 1.0
-_last_req = 0.0
+_last_req = {}                 # host -> время последнего запроса
+_throttle_lock = threading.Lock()
 
 
-def _throttle():
-    global _last_req
-    dt = time.time() - _last_req
-    if dt < PAUSE:
-        time.sleep(PAUSE - dt)
-    _last_req = time.time()
+def _throttle(host=""):
+    """Не чаще одного запроса в PAUSE секунд на каждый хост.
+    Разные сайты можно опрашивать параллельно (потокобезопасно)."""
+    while True:
+        with _throttle_lock:
+            now = time.time()
+            wait = PAUSE - (now - _last_req.get(host, 0.0))
+            if wait <= 0:
+                _last_req[host] = now
+                return
+        time.sleep(wait)
 
 
 def http_get(url, headers=None, data=None, timeout=30):
     """GET (or POST when data given). Returns decoded text."""
-    _throttle()
+    _throttle(urllib.parse.urlparse(url).netloc)
     h = {"User-Agent": UA, "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
          "Accept-Language": "sr,ru;q=0.8,en;q=0.7"}
     if headers:
