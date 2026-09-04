@@ -18,8 +18,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-FREE_MINUTES = 2000                       # GitHub Free, приватный репозиторий
-THRESHOLDS = (1500, 1850)                 # при каких значениях предупреждать
+FREE_MINUTES = 3000                       # GitHub Pro (4 $/мес), делится со всеми приватными репозиториями
+THRESHOLDS = (2200, 2700)                 # при каких значениях предупреждать
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "group_posted.json")
 
 TOKEN = os.environ.get("GITHUB_TOKEN", "")
@@ -79,13 +79,13 @@ def main():
     for th in THRESHOLDS:
         if used >= th and th not in warned:
             left = max(0, FREE_MINUTES - used)
-            text = (f"⚠️ Служебное: бесплатные минуты GitHub Actions заканчиваются.\n"
+            text = (f"⚠️ Служебное: минуты GitHub Actions (план Pro, 3000/мес) заканчиваются.\n"
                     f"Использовано ~{used} из {FREE_MINUTES} мин за {month}, осталось ~{left} мин "
                     f"(примерно {left // 150} дней работы ботов).\n\n"
                     f"Чтобы боты не остановились до конца месяца, выберите один из вариантов:\n"
                     f"1) GitHub → Settings → Billing → Budgets: добавить карту и бюджет на Actions "
                     f"(сверх лимита $0.008/мин, ~$15–20/мес);\n"
-                    f"2) перейти на GitHub Pro ($4/мес, 3000 мин);\n"
+                    f"2) временно сократить частоту запусков;\n"
                     f"3) сделать репозиторий публичным — минуты не ограничены, бесплатно.")
             tg_send(text)
             warned.append(th)
