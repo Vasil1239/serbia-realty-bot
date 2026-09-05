@@ -17,9 +17,10 @@
 Сбор идёт параллельно по источникам, посты — с шагом ~3 с (лимит Telegram 20/мин).
 
 Переменные окружения:
-  BOT_TOKEN      — токен бота (@BotFather)
-  GROUP_CHAT_ID  — числовой id группы
-  FORCE_RUN=1    — запустить вне расписания (для теста)
+  BOT_TOKEN         — токен бота (@BotFather)
+  GROUP_CHAT_ID     — текущая группа форматированных объявлений
+  ORIGINAL_CHAT_ID  — группа исходных объявлений до форматирования
+  FORCE_RUN=1       — запустить вне расписания (для теста)
 """
 
 import json
@@ -38,16 +39,15 @@ import sources as S
 # ================== НАСТРОЙКИ ==================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
+ORIGINAL_CHAT_ID = "-1004325987530"
 FORCE_RUN = os.environ.get("FORCE_RUN", "") == "1"
 
 LOCAL_TZ = ZoneInfo("Europe/Belgrade")
-POST_WINDOW_LOCAL = (9, 22)          # публикуем строго с 09:00 до 22:00; после 22:00 — ни одного поста,
-                                     # что не успели — уйдёт с утренним запуском
-LOOKBACK_HOURS = 16                  # утренний запуск покрывает вечер и ночь
-MAX_POSTS_PER_KIND = None            # None = без лимита, публикуем всё найденное
-MIN_POST_INTERVAL = 3.05             # лимит Telegram 20 сообщений/мин в группу = 1 пост в 3 с
-                                     # (считается от начала предыдущей отправки, а не после неё)
-COLLECT_WORKERS = 8                  # параллельный сбор: по потоку на источник
+POST_WINDOW_LOCAL = (9, 22)
+LOOKBACK_HOURS = 16
+MAX_POSTS_PER_KIND = None
+MIN_POST_INTERVAL = 3.05
+COLLECT_WORKERS = 8
 PRIORITY_KEYWORDS = ("beograd", "belgrade", "белград", "novi beograd")
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "group_posted.json")
 
@@ -58,7 +58,6 @@ CATEGORIES = [
     ("houses",     "rent", "Аренда дома",      "#аренда #дом"),
 ]
 
-# сайты с точной датой публикации
 DATED_SITES = {
     "4zida":           lambda k, d: fetch_4zida(k, d),
     "kupujemprodajem": lambda k, d: S.fetch_kupujemprodajem(k, d, page=2),
@@ -66,12 +65,10 @@ DATED_SITES = {
     "cityexpert":      lambda k, d: S.fetch_cityexpert(k, d),
     "nadjidom":        lambda k, d: S.fetch_nadjidom(k, d),
 }
-# сайты без даты в выдаче — берём только id новее уже виденного (водяной знак)
 WATERMARK_SITES = {
     "imovina":       lambda k, d: S.fetch_imovina(k, d),
     "nekretnine365": lambda k, d: S.fetch_nekretnine365(k, d),
 }
-# Telegram-каналы: (канал, kind, deal или "both")
 TG_CHANNELS = [
     ("belgrade_apartmens", "apartments", "rent"),
     ("novisad_apartmens",  "apartments", "rent"),
@@ -91,7 +88,6 @@ SOURCE_NAMES = {
     "cityexpert": "CityExpert", "nadjidom": "nadjidom.com", "imovina": "imovina.net",
     "nekretnine365": "nekretnine365.com",
 }
-# ===============================================
 
 ROOMS_RU = {"0.5": "студия", "1": "1-комн.", "1.0": "1-комн.", "1.5": "1.5-комн.",
             "2": "2-комн.", "2.0": "2-комн.", "2.5": "2.5-комн.", "3": "3-комн.",
@@ -115,7 +111,6 @@ def log(msg):
     print(msg, flush=True)
 
 
-# ---------- 4zida (адаптер к общему формату) ----------
 def fetch_4zida(kind, deal, pages=2):
     out = []
     for page in range(1, pages + 1):
@@ -143,7 +138,6 @@ def fetch_4zida(kind, deal, pages=2):
     return out
 
 
-# ---------- Telegram ----------
 def tg_call(method, payload):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     data = urllib.parse.urlencode(payload).encode()
@@ -173,7 +167,7 @@ _last_send = 0.0
 
 
 def send_paced(text, photo):
-    """Отправка с выдержкой MIN_POST_INTERVAL между началами отправок и одним повтором при 429."""
+    """Текущая отправка форматированного объявления в GROUP_CHAT_ID."""
     global _last_send
     for attempt in range(2):
         wait = MIN_POST_INTERVAL - (time.time() - _last_send)
@@ -190,7 +184,72 @@ def send_paced(text, photo):
     return resp
 
 
-# ---------- состояние ----------
+def format_original_post(r):
+    """Исходная копия до format_post: сохраняет Telegram-текст и все доступные ссылки."""
+    if r["source"].startswith("tg_"):
+        text = (r.get("text") or "").strip()
+        source_url = (r.get("url") or "").strip()
+        if source_url and source_url not in text:
+            text = f"{text}\n\n{source_url}" if text else source_url
+        return text or source_url or "Объявление без текста"
+
+    lines = []
+    if r.get("title"):
+        lines.append(str(r["title"]).strip())
+    if r.get("desc"):
+        lines.append(str(r["desc"]).strip())
+    if r.get("price"):
+        lines.append(f"Цена: {fmt_money(r['price'])} €")
+    if r.get("m2"):
+        lines.append(f"Площадь: {fmt_money(r['m2'])} м²")
+    if r.get("rooms"):
+        lines.append(f"Комнат: {r['rooms']}")
+    if r.get("place"):
+        lines.append(f"Место: {r['place']}")
+    if r.get("address"):
+        lines.append(f"Адрес: {r['address']}")
+    if r.get("url"):
+        lines.append(f"Источник: {r['url']}")
+    return "\n\n".join(lines)[:4000] or "Объявление без текстового описания"
+
+
+def send_original_post(r):
+    """Отправляет исходную копию в ORIGINAL_CHAT_ID до текущей обработки."""
+    original_text = format_original_post(r)
+    if r.get("photo"):
+        resp = tg_call("sendPhoto", {
+            "chat_id": ORIGINAL_CHAT_ID,
+            "photo": r["photo"],
+            "caption": original_text[:1000],
+        })
+        if resp.get("ok") or resp.get("error_code") == 429:
+            return resp
+        log(f"  ! оригинал: фото не принято ({resp.get('description')}), шлю текстом")
+    return tg_call("sendMessage", {
+        "chat_id": ORIGINAL_CHAT_ID,
+        "text": original_text[:4000],
+        "disable_web_page_preview": False,
+    })
+
+
+def send_original_paced(r):
+    """Отправляет оригинал с соблюдением лимита Telegram."""
+    global _last_send
+    for attempt in range(2):
+        wait = MIN_POST_INTERVAL - (time.time() - _last_send)
+        if wait > 0:
+            time.sleep(wait)
+        _last_send = time.time()
+        resp = send_original_post(r)
+        if resp.get("error_code") == 429 and attempt == 0:
+            retry = int((resp.get("parameters") or {}).get("retry_after", 30)) + 1
+            log(f"  ! оригинал: Telegram просит подождать {retry} с")
+            time.sleep(retry)
+            continue
+        return resp
+    return resp
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -209,7 +268,6 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=1)
 
 
-# ---------- утилиты ----------
 def parse_dt(s):
     if not s:
         return None
@@ -226,13 +284,12 @@ def is_fresh(r, since):
     dt = parse_dt(r.get("created"))
     if dt is None:
         return False
-    if len(r.get("created") or "") <= 10:          # только дата (nadjidom) — берём сегодня/вчера
+    if len(r.get("created") or "") <= 10:
         return dt.date() >= (since.astimezone(LOCAL_TZ).date())
     return dt >= since
 
 
 def kind_matches(r, kind):
-    """nadjidom подмешивает квартиры в раздел домов и наоборот — отсекаем по URL."""
     u = (r.get("url") or "").lower()
     if r["source"] != "nadjidom":
         return True
@@ -314,7 +371,6 @@ def format_post(r, kind, deal, title, hashtags):
     desc = r.get("desc") or (r.get("title") if r["source"] != "4zida" else None)
     if desc:
         lines.append(esc(re.sub(r"\s+", " ", desc).strip()[:160]))
-    # ссылки на первоисточник
     if r["source"].startswith("tg_"):
         ext = [S.htmllib.unescape(l) for l in r.get("ext_links", []) if "maps" not in l and "google" not in l]
         if ext:
@@ -330,9 +386,7 @@ def format_post(r, kind, deal, title, hashtags):
     return "\n".join(lines)
 
 
-# ---------- сбор ----------
 def tg_category(ch_kind, ch_deal, r):
-    """Определяет категорию поста из Telegram-канала."""
     txt = (r.get("text") or "").lower()
     if ch_deal == "both":
         deal = "sale" if re.search(r"прода|prodaj|sale|купить", txt) else "rent"
@@ -344,7 +398,6 @@ def tg_category(ch_kind, ch_deal, r):
 
 
 def _fetch_site(name, fn):
-    """Один сайт по всем категориям (выполняется в своём потоке; запросы к сайту — последовательно)."""
     out = []
     for kind, deal, _, _ in CATEGORIES:
         try:
@@ -362,11 +415,8 @@ def _fetch_channel(ch):
 
 
 def collect(since, state):
-    """Возвращает {(kind, deal): [записи]} со всех источников.
-    Сетевая часть идёт параллельно (поток на источник), фильтрация и состояние — в основном потоке."""
     bucket = {(k, d): [] for k, d, _, _ in CATEGORIES}
     stats = {}
-
     with ThreadPoolExecutor(max_workers=COLLECT_WORKERS) as ex:
         dated_f = [ex.submit(_fetch_site, n, fn) for n, fn in DATED_SITES.items()]
         wm_f = [ex.submit(_fetch_site, n, fn) for n, fn in WATERMARK_SITES.items()]
@@ -394,9 +444,7 @@ def collect(since, state):
             if not ids:
                 continue
             wm = state["watermark"].get(wm_key)
-            new_items = []
-            if wm is not None:
-                new_items = [r for r, i in zip(items, ids) if i > wm]
+            new_items = [r for r, i in zip(items, ids) if wm is not None and i > wm] if wm is not None else []
             state["watermark"][wm_key] = max(ids + [wm or 0])
             stats[name] = stats.get(name, 0) + len(new_items)
             bucket[(kind, deal)] += new_items
@@ -412,7 +460,7 @@ def collect(since, state):
             txt = r.get("text") or ""
             if not r.get("price") or not is_fresh(r, since) or len(txt) < 30:
                 continue
-            if txt.startswith("📊") or "owner listings today" in txt:   # сводки, не объявления
+            if txt.startswith("📊") or "owner listings today" in txt:
                 continue
             kind, deal = tg_category(ch_kind, ch_deal, r)
             r["place"] = r.get("place") or ch_place(ch)
@@ -420,7 +468,6 @@ def collect(since, state):
             bucket[(kind, deal)].append(r)
             n += 1
         stats[f"@{ch}"] = n
-
     log("  свежих по источникам: " + ", ".join(f"{k}={v}" for k, v in stats.items()))
     return bucket
 
@@ -435,7 +482,6 @@ def ch_place(ch):
 
 
 def pick(items, state, limit):
-    """Отбор с чередованием источников; Белград и фото — в приоритете."""
     seen_fp = set()
     fresh = []
     for r in items:
@@ -492,6 +538,11 @@ def main():
                 save_state(state)
                 log(f"Опубликовано за запуск: {posted_now}")
                 return
+
+            original_resp = send_original_paced(r)
+            if not original_resp.get("ok"):
+                log(f"  ! оригинал не отправлен в {ORIGINAL_CHAT_ID}: {original_resp}")
+
             text = format_post(r, kind, deal, title, hashtags)
             resp = send_paced(text, r.get("photo"))
             if resp.get("ok"):
@@ -501,7 +552,7 @@ def main():
                 posted_now += 1
                 log(f"  ✓ {source_label(r)}: {r['url']}")
                 if posted_now % 20 == 0:
-                    save_state(state)          # промежуточное сохранение на случай обрыва
+                    save_state(state)
             else:
                 log(f"  ! Telegram отказал: {resp}")
 
