@@ -30,7 +30,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_БОТА") 
 CHANNEL = "@serbia_hays"          # канал, куда публикуем (бот должен быть админом)
 LOOKBACK_HOURS = 13               # искать объявления не старше N часов (утренний запуск покрывает ночь)
 MAX_POSTS_PER_KIND = 5            # максимум постов на категорию (5 продаж + 5 аренд)
-CONTACT = "@fortyna1239"          # личка для связи (вместо ссылки на источник)
+CONTACT = "@fortyna1239"          # (не используется: в посте даётся ссылка на первоисточник)
 PAGES_TO_SCAN = 10                # сколько страниц выдачи сканировать на категорию
 PAUSE_BETWEEN_POSTS = 25          # секунд между постами
 CITY_KEYWORDS = ()                # () = вся Сербия; можно ограничить, например ("beograd",)
@@ -160,7 +160,7 @@ def format_post(ad, deal_ru, hashtag):
     lines.append(f"📍 {address}")
     if desc:
         lines.append(desc[:120])
-    lines.append(f"📩 Подробности и просмотр — пишите в личку: {CONTACT}")
+    lines.append(f'🔗 <a href="{url}">Источник: 4zida.rs</a>')
     city_tag = city_tag_from_path(ad.get("urlPath", ""))
     tags = f"{hashtag} {city_tag}" + (" #сербия" if city_tag != "#сербия" else "")
     lines.append(tags)
